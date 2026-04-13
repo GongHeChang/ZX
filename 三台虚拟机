@@ -1,0 +1,2307 @@
+#!/usr/bin/env python3
+
+"""
+====================================================
+
+VM1 - 传感器模拟器
+====================================================
+
+模拟8种传感器的数据采集，通过TCP发送给ESP32（VM2）
+
+每种传感器按真实物理范围生成随机数据，并可手动触发特殊事件
+====================================================
+
+"""
+
+import socket
+import json
+import time
+import math
+import random
+import threading
+import sys
+from datetime import datetime
+
+# ========== 配置 ==========
+
+ESP32_IP = "192.168.110.129"  # ← 替换为VM2的实际IP
+ESP32_PORT = 9001
+SEND_INTERVAL = 0.5  # 每0.5秒发送一次数据
+
+# ========== 传感器类型定义 ==========
+
+SENSOR_TYPES = {
+    1: {"name": "温度传感器",    "unit": "°C",   "min": -10, "max": 50,    "icon": "🌡️"},
+    2: {"name": "光线传感器",    "unit": "Lux",  "min": 0,   "max": 65535, "icon": "💡"},
+    3: {"name": "声音传感器",    "unit": "mV",   "min": 0,   "max": 1024,  "icon": "🔊"},
+    4: {"name": "加速度传感器",  "unit": "m/s²", "min": -20, "max": 20,    "icon": "🏃"},
+    5: {"name": "距离传感器",    "unit": "cm",   "min": 2,   "max": 400,   "icon": "📏"},
+    6: {"name": "湿度传感器",    "unit": "%RH",  "min": 0,   "max": 100,   "icon": "💧"},
+    7: {"name": "气压传感器",    "unit": "hPa",  "min": 300, "max": 1100,  "icon": "🌀"},
+    8: {"name": "磁场传感器",    "unit": "μT",   "min": -100,"max": 100,   "icon": "🧲"},
+}
+
+class SensorSimulator:
+    """传感器模拟器主类"""
+    
+
+    def __init__(self):
+        # 当前激活的传感器（模拟"插入"效果）
+        self.active_sensors = {1: True}  # 默认只有温度传感器
+        
+        # 各传感器的当前基准值（模拟真实环境）
+        self.base_values = {
+            1: 25.0,    # 室温25°C
+            2: 500.0,   # 室内光照500Lux
+            3: 100.0,   # 环境噪音
+            4: 9.8,     # 静止时重力加速度
+            5: 100.0,   # 100cm距离
+            6: 45.0,    # 45%湿度
+            7: 1013.25, # 标准大气压
+            8: 30.0,    # 地磁场约30μT
+        }
+        
+        # 特殊事件标记
+        self.special_event = None
+        self.event_duration = 0
+        
+        # 连接状态
+        self.connected = False
+        self.socket = None
+        
+    def generate_sensor_data(self, sensor_id):
+        """生成带有自然波动的传感器数据"""
+        info = SENSOR_TYPES[sensor_id]
+        base = self.base_values[sensor_id]
+        
+        # 添加自然噪声（正弦波动 + 随机噪声）
+        time_factor = time.time()
+        natural_wave = math.sin(time_factor * 0.5) * (info["max"] - info["min"]) * 0.01
+        noise = random.gauss(0, (info["max"] - info["min"]) * 0.005)
+        
+        value = base + natural_wave + noise
+        
+        # 处理特殊事件
+        if self.special_event and self.event_duration > 0:
+            value = self._apply_special_event(sensor_id, value)
+            self.event_duration -= 1
+            if self.event_duration <= 0:
+                self.special_event = None
+        
+        # 确保在合理范围内
+        value = max(info["min"], min(info["max"], value))
+        
+        return {
+            "sensor_id": sensor_id,
+            "sensor_type": sensor_id,
+            "sensor_name": info["name"],
+            "raw_value": round(value, 3),
+            "unit": info["unit"],
+            "timestamp": datetime.now().isoformat(),
+            "quality": random.randint(85, 100)
+        }
+    
+    def _apply_special_event(self, sensor_id, value):
+        """应用特殊事件到传感器数据"""
+        if self.special_event == "freefall" and sensor_id == 4:
+            return random.uniform(0.1, 0.5)  # 近似失重
+        elif self.special_event == "hot_touch" and sensor_id == 1:
+            return self.base_values[1] + random.uniform(5, 12)  # 手握升温
+        elif self.special_event == "cold_touch" and sensor_id == 1:
+            return random.uniform(-5, 5)  # 冰块降温
+        elif self.special_event == "loud_sound" and sensor_id == 3:
+            return random.uniform(800, 1020)  # 大声
+        elif self.special_event == "bright_light" and sensor_id == 2:
+            return random.uniform(10000, 50000)  # 强光
+        elif self.special_event == "dark" and sensor_id == 2:
+            return random.uniform(0, 10)  # 遮挡
+        elif self.special_event == "shake" and sensor_id == 4:
+            return random.uniform(-15, 15)  # 摇晃
+        elif self.special_event == "magnet" and sensor_id == 8:
+            return random.uniform(60, 100)  # 靠近磁铁
+        return value
+    
+    def trigger_event(self, event_name, duration=10):
+        """触发特殊事件"""
+        self.special_event = event_name
+        self.event_duration = duration  # 持续几个采集周期
+        print(f"\n🎯 特殊事件触发: {event_name} (持续{duration}个周期)")
+    
+    def plug_sensor(self, sensor_id):
+        """模拟插入传感器"""
+        if sensor_id in SENSOR_TYPES:
+            self.active_sensors[sensor_id] = True
+            info = SENSOR_TYPES[sensor_id]
+            print(f"\n🔌 传感器已插入: {info['icon']} {info['name']} (ID:{sensor_id})")
+    
+    def unplug_sensor(self, sensor_id):
+        """模拟拔出传感器"""
+        if sensor_id in self.active_sensors:
+            del self.active_sensors[sensor_id]
+            info = SENSOR_TYPES[sensor_id]
+            print(f"\n⏏️  传感器已拔出: {info['icon']} {info['name']} (ID:{sensor_id})")
+    
+    def connect_to_esp32(self):
+        """连接到ESP32模拟器"""
+        while True:
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.connect((ESP32_IP, ESP32_PORT))
+                self.connected = True
+                print(f"\n✅ 已连接到ESP32模拟器 ({ESP32_IP}:{ESP32_PORT})")
+                return True
+            except ConnectionRefusedError:
+                print(f"⏳ 等待ESP32模拟器启动... ({ESP32_IP}:{ESP32_PORT})")
+                time.sleep(3)
+            except Exception as e:
+                print(f"❌ 连接失败: {e}")
+                time.sleep(3)
+    
+    def send_data(self, data):
+        """发送数据到ESP32"""
+        try:
+            message = json.dumps(data) + "\n"
+            self.socket.sendall(message.encode('utf-8'))
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.connected = False
+            print("\n❌ 与ESP32的连接断开，尝试重连...")
+            self.connect_to_esp32()
+            return False
+    
+    def data_sending_loop(self):
+        """数据发送主循环"""
+        cycle = 0
+        while True:
+            if not self.connected:
+                time.sleep(1)
+                continue
+                
+            # 收集所有激活传感器的数据
+            sensor_readings = []
+            for sensor_id in list(self.active_sensors.keys()):
+                data = self.generate_sensor_data(sensor_id)
+                sensor_readings.append(data)
+            
+            # 打包发送
+            packet = {
+                "type": "sensor_batch",
+                "active_sensors": list(self.active_sensors.keys()),
+                "readings": sensor_readings,
+                "cycle": cycle
+            }
+            
+            if self.send_data(packet):
+                # 简洁的状态显示
+                active_icons = " ".join(
+                    [SENSOR_TYPES[sid]["icon"] for sid in self.active_sensors]
+                )
+                values_str = " | ".join(
+                    [f"{d['raw_value']}{d['unit']}" for d in sensor_readings]
+                )
+                sys.stdout.write(
+                    f"\r📡 周期#{cycle:04d} [{active_icons}] {values_str}    "
+                )
+                sys.stdout.flush()
+            
+            cycle += 1
+            time.sleep(SEND_INTERVAL)
+
+
+def print_help():
+    """打印帮助菜单"""
+    print("""
+╔══════════════════════════════════════════════════════╗
+║          🎮 传感器模拟器 - 控制面板                   ║
+╠══════════════════════════════════════════════════════╣
+║  传感器插拔:                                         ║
+║    p <ID>    插入传感器  (例: p 4 = 插入加速度)       ║
+║    u <ID>    拔出传感器  (例: u 1 = 拔出温度)         ║
+║                                                      ║
+║  传感器ID对照:                                        ║
+║    1=温度  2=光线  3=声音  4=加速度                    ║
+║    5=距离  6=湿度  7=气压  8=磁场                     ║
+║                                                      ║
+║  特殊事件触发:                                        ║
+║    e freefall    自由落体(加速度→0)                    ║
+║    e hot_touch   手握升温(温度↑)                      ║
+║    e cold_touch  冰块降温(温度↓)                      ║
+║    e loud_sound  大声喊叫(声音↑)                      ║
+║    e bright_light 强光照射(光线↑)                     ║
+║    e dark        遮挡光线(光线↓)                      ║
+║    e shake       摇晃设备(加速度波动)                  ║
+║    e magnet      靠近磁铁(磁场↑)                      ║
+║                                                      ║
+║  其他:                                               ║
+║    h    显示帮助                                      ║
+║    q    退出                                          ║
+╚══════════════════════════════════════════════════════╝
+""")
+
+
+def command_loop(simulator):
+    """命令输入循环"""
+    print_help()
+    while True:
+        try:
+            cmd = input("\n> ").strip().lower()
+            if not cmd:
+                continue
+            
+
+            parts = cmd.split()
+            
+            if parts[0] == 'q':
+                print("👋 传感器模拟器关闭")
+                sys.exit(0)
+            elif parts[0] == 'h':
+                print_help()
+            elif parts[0] == 'p' and len(parts) > 1:
+                sensor_id = int(parts[1])
+                simulator.plug_sensor(sensor_id)
+            elif parts[0] == 'u' and len(parts) > 1:
+                sensor_id = int(parts[1])
+                simulator.unplug_sensor(sensor_id)
+            elif parts[0] == 'e' and len(parts) > 1:
+                event = parts[1]
+                duration = int(parts[2]) if len(parts) > 2 else 10
+                simulator.trigger_event(event, duration)
+            else:
+                print("❓ 未知命令，输入 h 查看帮助")
+                
+        except (ValueError, IndexError):
+            print("❓ 命令格式错误，输入 h 查看帮助")
+        except KeyboardInterrupt:
+            print("\n👋 传感器模拟器关闭")
+            sys.exit(0)
+
+
+def main():
+    print("=" * 56)
+    print("    🔬 VM1 - 传感器模拟器")
+    print("    模拟物理传感器数据采集")
+    print("=" * 56)
+    
+
+    sim = SensorSimulator()
+    
+    # 连接到ESP32
+    sim.connect_to_esp32()
+    
+    # 启动数据发送线程
+    send_thread = threading.Thread(target=sim.data_sending_loop, daemon=True)
+    send_thread.start()
+    
+    # 主线程运行命令输入
+    command_loop(sim)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+    # 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # VM2
+    # 创建RTOS主程序
+    # 
+    #!/usr/bin/env python3
+
+"""
+====================================================
+
+VM2 - ESP32 FreeRTOS 模拟器
+====================================================
+
+用 Python 线程模拟 FreeRTOS 任务调度
+
+- Task1: 传感器数据接收 (模拟I2C/SPI读取) — 高优先级
+
+- Task2: 边缘计算处理 — 中高优先级
+
+- Task3: 通信管理 (向APP发送数据) — 中优先级
+
+- Task4: 离线游戏逻辑 — 低优先级
+
+- Task5: 传感器热插拔检测 — 低优先级
+  ====================================================
+
+  """
+
+import threading
+import queue
+import socket
+import json
+import time
+import sys
+import signal
+from datetime import datetime
+
+from edge_compute import EdgeComputeEngine
+from protocol import ProtocolCodec
+from offline_cache import OfflineCache
+
+# ========== 配置 ==========
+
+SENSOR_LISTEN_PORT = 9001   # 监听传感器数据
+APP_SERVE_PORT = 9002       # 向APP提供数据
+MAX_QUEUE_SIZE = 64
+
+# ========== 全局队列（模拟FreeRTOS Queue）==========
+
+xSensorDataQueue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+xProcessedDataQueue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+xAppCommandQueue = queue.Queue(maxsize=16)
+
+# ========== 全局状态 ==========
+
+system_state = {
+    "sensor_connected": False,
+    "app_connected": False,
+    "active_sensors": [],
+    "total_processed": 0,
+    "events_detected": 0,
+    "uptime_start": time.time(),
+    "offline_mode": False,
+}
+
+# 互斥锁（模拟FreeRTOS Mutex）
+
+state_mutex = threading.Lock()
+
+# ========== 边缘计算引擎 ==========
+
+edge_engine = EdgeComputeEngine()
+protocol = ProtocolCodec()
+offline_cache = OfflineCache()
+
+
+class RTOSTask:
+    """FreeRTOS 任务基类"""
+    def __init__(self, name, priority, core, period_ms=None):
+        self.name = name
+        self.priority = priority
+        self.core = core
+        self.period_ms = period_ms
+        self.running = True
+        self.thread = None
+        self.cycle_count = 0
+    
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run_wrapper, daemon=True)
+        self.thread.start()
+        print(f"  ✅ Task [{self.name}] 已启动 | 优先级:P{self.priority} | 核心:Core{self.core}")
+    
+    def _run_wrapper(self):
+        try:
+            self.run()
+        except Exception as e:
+            print(f"\n❌ Task [{self.name}] 异常: {e}")
+    
+    def run(self):
+        raise NotImplementedError
+
+
+# ================================================================
+
+# Task 1: 传感器数据接收任务
+
+# 模拟 ESP32 从 I2C/SPI 总线读取传感器数据
+
+# 实际实现：TCP Server 接收来自 VM1 的传感器数据
+
+# ================================================================
+
+class SensorReceiveTask(RTOSTask):
+    def __init__(self):
+        super().__init__("SensorReceive", priority=5, core=0, period_ms=50)
+        self.server_socket = None
+        self.client_socket = None
+        
+
+    def run(self):
+        # 创建TCP服务器，等待传感器连接
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('0.0.0.0', SENSOR_LISTEN_PORT))
+        self.server_socket.listen(1)
+        print(f"\n📡 等待传感器连接 (端口 {SENSOR_LISTEN_PORT})...")
+        
+        while self.running:
+            try:
+                self.client_socket, addr = self.server_socket.accept()
+                print(f"\n✅ 传感器已连接: {addr}")
+                with state_mutex:
+                    system_state["sensor_connected"] = True
+                
+                self._receive_loop()
+                
+            except Exception as e:
+                print(f"\n⚠️ 传感器连接异常: {e}")
+                with state_mutex:
+                    system_state["sensor_connected"] = False
+                time.sleep(1)
+    
+    def _receive_loop(self):
+        buffer = ""
+        while self.running:
+            try:
+                data = self.client_socket.recv(4096).decode('utf-8')
+                if not data:
+                    print("\n⚠️ 传感器断开连接")
+                    with state_mutex:
+                        system_state["sensor_connected"] = False
+                    break
+                
+                buffer += data
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    try:
+                        packet = json.loads(line)
+                        # 将传感器数据推入队列
+                        if not xSensorDataQueue.full():
+                            xSensorDataQueue.put(packet, block=False)
+                            self.cycle_count += 1
+                            
+                            # 更新激活传感器列表
+                            with state_mutex:
+                                system_state["active_sensors"] = packet.get("active_sensors", [])
+                    except json.JSONDecodeError:
+                        pass
+                        
+            except (ConnectionResetError, BrokenPipeError):
+                print("\n⚠️ 传感器连接断开")
+                with state_mutex:
+                    system_state["sensor_connected"] = False
+                break
+
+
+# ================================================================
+
+# Task 2: 边缘计算任务
+
+# 从传感器队列取数据，进行本地计算和事件检测
+
+# ================================================================
+
+class EdgeComputeTask(RTOSTask):
+    def __init__(self):
+        super().__init__("EdgeCompute", priority=4, core=1)
+    
+
+    def run(self):
+        while self.running:
+            try:
+                # 从队列获取传感器数据（阻塞等待，模拟 xQueueReceive）
+                raw_packet = xSensorDataQueue.get(timeout=1)
+                
+                readings = raw_packet.get("readings", [])
+                processed_results = []
+                
+                for reading in readings:
+                    # 调用边缘计算引擎
+                    result = edge_engine.process(reading)
+                    processed_results.append(result)
+                    
+                    # 检测到事件时打印
+                    if result.get("event_type") != "none":
+                        with state_mutex:
+                            system_state["events_detected"] += 1
+                        event_desc = result.get("description", "")
+                        print(f"\n🎯 事件检测: [{result['event_type']}] {event_desc}")
+                
+                # 封装处理后的数据
+                processed_packet = {
+                    "type": "processed_batch",
+                    "results": processed_results,
+                    "active_sensors": raw_packet.get("active_sensors", []),
+                    "cycle": raw_packet.get("cycle", 0),
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                # 推入处理后队列
+                if not xProcessedDataQueue.full():
+                    xProcessedDataQueue.put(processed_packet, block=False)
+                
+                with state_mutex:
+                    system_state["total_processed"] += 1
+                
+                self.cycle_count += 1
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"\n⚠️ 边缘计算异常: {e}")
+
+
+# ================================================================
+
+# Task 3: 通信管理任务
+
+# 将处理后的数据发送给 APP (VM3)
+
+# ================================================================
+
+class CommManagerTask(RTOSTask):
+    def __init__(self):
+        super().__init__("CommManager", priority=3, core=0)
+        self.server_socket = None
+        self.app_socket = None
+    
+
+    def run(self):
+        # 创建TCP服务器，等待APP连接
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(('0.0.0.0', APP_SERVE_PORT))
+        self.server_socket.listen(1)
+        print(f"\n📱 等待APP连接 (端口 {APP_SERVE_PORT})...")
+        
+        while self.running:
+            try:
+                self.app_socket, addr = self.server_socket.accept()
+                print(f"\n✅ APP已连接: {addr}")
+                with state_mutex:
+                    system_state["app_connected"] = True
+                    system_state["offline_mode"] = False
+                
+                # 同步离线缓存数据
+                self._sync_offline_cache()
+                
+                self._send_loop()
+                
+            except Exception as e:
+                print(f"\n⚠️ APP连接异常: {e}")
+                with state_mutex:
+                    system_state["app_connected"] = False
+                    system_state["offline_mode"] = True
+                time.sleep(1)
+    
+    def _send_loop(self):
+        """持续发送处理后的数据给APP"""
+        while self.running:
+            try:
+                processed = xProcessedDataQueue.get(timeout=1)
+                
+                # 编码为协议格式
+                message = protocol.encode(processed)
+                
+                try:
+                    self.app_socket.sendall((message + "\n").encode('utf-8'))
+                    self.cycle_count += 1
+                except (BrokenPipeError, ConnectionResetError):
+                    print("\n⚠️ APP连接断开，切换到离线模式")
+                    with state_mutex:
+                        system_state["app_connected"] = False
+                        system_state["offline_mode"] = True
+                    # 缓存数据
+                    offline_cache.store(processed)
+                    break
+                    
+            except queue.Empty:
+                # 发送心跳包
+                try:
+                    heartbeat = protocol.encode_heartbeat(system_state)
+                    self.app_socket.sendall((heartbeat + "\n").encode('utf-8'))
+                except:
+                    break
+    
+    def _sync_offline_cache(self):
+        """APP重新连接时同步缓存数据"""
+        cached = offline_cache.get_all()
+        if cached:
+            print(f"\n📤 正在同步 {len(cached)} 条离线缓存数据...")
+            for item in cached:
+                try:
+                    message = protocol.encode(item)
+                    self.app_socket.sendall((message + "\n").encode('utf-8'))
+                    time.sleep(0.05)
+                except:
+                    break
+            offline_cache.clear()
+            print("✅ 离线数据同步完成")
+
+
+# ================================================================
+
+# Task 4: 离线游戏逻辑任务
+
+# 当APP未连接时，在本地运行简单游戏逻辑
+
+# ================================================================
+
+class OfflineGameTask(RTOSTask):
+    def __init__(self):
+        super().__init__("OfflineGame", priority=2, core=1)
+        self.local_achievements = []
+    
+
+    def run(self):
+        while self.running:
+            with state_mutex:
+                is_offline = system_state["offline_mode"]
+            
+            if is_offline:
+                # 离线模式激活
+                try:
+                    processed = xProcessedDataQueue.get(timeout=2)
+                    
+                    # 本地勋章判定
+                    for result in processed.get("results", []):
+                        medal = self._check_local_achievement(result)
+                        if medal:
+                            self.local_achievements.append(medal)
+                            print(f"\n🏅 [离线] 解锁勋章: {medal['name']} — {medal['description']}")
+                    
+                    # 离线模式下缓存数据
+                    offline_cache.store(processed)
+                    
+                except queue.Empty:
+                    pass
+            else:
+                time.sleep(1)
+    
+    def _check_local_achievement(self, result):
+        """本地简单勋章判定（不需要AI的基础勋章）"""
+        event = result.get("event_type", "none")
+        sensor = result.get("sensor_type", 0)
+        value = result.get("calibrated_value", 0)
+        
+        # 基础勋章判定
+        if event == "freefall_detected" and "newton_apple" not in [m.get("id") for m in self.local_achievements]:
+            return {
+                "id": "newton_apple", "name": "🍎 牛顿的苹果",
+                "description": "检测到自由落体！重力加速度≈9.8m/s²"
+            }
+        elif event == "body_heat" and "joule_flame" not in [m.get("id") for m in self.local_achievements]:
+            return {
+                "id": "joule_flame", "name": "🔥 焦耳的火焰",
+                "description": "检测到温度上升！能量在转移呢"
+            }
+        elif event == "freezing" and "kelvin_ice" not in [m.get("id") for m in self.local_achievements]:
+            return {
+                "id": "kelvin_ice", "name": "❄️ 开尔文的冰晶",
+                "description": "好冷！分子们在发抖"
+            }
+        elif event == "loud_sound" and "hertz_ripple" not in [m.get("id") for m in self.local_achievements]:
+            return {
+                "id": "hertz_ripple", "name": "🔔 赫兹的波纹",
+                "description": "好大的声音！声波在空气中传播"
+            }
+        
+        return None
+
+
+# ================================================================
+
+# Task 5: 状态监控任务
+
+# 定期打印系统状态
+
+# ================================================================
+
+class MonitorTask(RTOSTask):
+    def __init__(self, tasks):
+        super().__init__("Monitor", priority=1, core=0, period_ms=5000)
+        self.tasks = tasks
+    
+
+    def run(self):
+        while self.running:
+            time.sleep(5)
+            with state_mutex:
+                uptime = int(time.time() - system_state["uptime_start"])
+                sensor_status = "🟢 已连接" if system_state["sensor_connected"] else "🔴 未连接"
+                app_status = "🟢 已连接" if system_state["app_connected"] else "🔴 未连接"
+                mode = "📴 离线模式" if system_state["offline_mode"] else "🌐 在线模式"
+                active = system_state["active_sensors"]
+                total = system_state["total_processed"]
+                events = system_state["events_detected"]
+            
+            print(f"\n{'─'*60}")
+            print(f"  ⏱️  运行时间: {uptime}s | {mode}")
+            print(f"  📡 传感器: {sensor_status} | 📱 APP: {app_status}")
+            print(f"  🔌 活跃传感器: {active}")
+            print(f"  📊 已处理: {total} | 🎯 事件: {events} | 💾 缓存: {offline_cache.count()}")
+            print(f"{'─'*60}")
+
+
+# ================================================================
+
+# 主函数 (模拟 app_main)
+
+# ================================================================
+
+def app_main():
+    print("=" * 60)
+    print("    🔧 ESP32 FreeRTOS 模拟器")
+    print("    模拟嵌入式 RTOS 多任务实时处理")
+    print("=" * 60)
+    print()
+    print("  初始化子系统...")
+    print(f"  ✅ 边缘计算引擎初始化完成")
+    print(f"  ✅ 通信协议栈初始化完成")
+    print(f"  ✅ 离线缓存初始化完成 (容量: {offline_cache.max_size})")
+    print()
+    print("  创建 RTOS 任务...")
+    
+
+    # 创建任务（模拟 xTaskCreatePinnedToCore）
+    task1 = SensorReceiveTask()
+    task2 = EdgeComputeTask()
+    task3 = CommManagerTask()
+    task4 = OfflineGameTask()
+    task5 = MonitorTask([task1, task2, task3, task4])
+    
+    tasks = [task1, task2, task3, task4, task5]
+    
+    for task in tasks:
+        task.start()
+    
+    print()
+    print("  🚀 所有任务已启动，系统运行中...")
+    print("  按 Ctrl+C 停止")
+    
+    # 保持主线程运行
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n\n👋 ESP32 模拟器关闭")
+        for task in tasks:
+            task.running = False
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    app_main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# VM2
+
+# 创建边缘计算引擎nano edge_compute.py
+
+
+    """
+
+边缘计算引擎 — 在ESP32本地进行数据处理
+模拟滑动窗口、趋势分析、事件检测
+"""
+import math
+import time
+from collections import deque
+
+class EdgeComputeEngine:
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        # 每种传感器维护一个滑动窗口
+        self.windows = {}
+        
+
+    def process(self, reading):
+        """处理单条传感器数据，返回带边缘计算结果的数据"""
+        sensor_type = reading.get("sensor_type", 0)
+        raw_value = reading.get("raw_value", 0)
+        
+        # 更新滑动窗口
+        if sensor_type not in self.windows:
+            self.windows[sensor_type] = deque(maxlen=self.window_size)
+        self.windows[sensor_type].append(raw_value)
+        
+        window = list(self.windows[sensor_type])
+        
+        # 计算统计特征
+        avg = sum(window) / len(window) if window else raw_value
+        std_dev = self._std_dev(window) if len(window) > 1 else 0
+        trend = self._trend(window) if len(window) > 2 else 0
+        
+        # 传感器特定的边缘计算
+        computed_value = raw_value
+        event_type = "none"
+        description = ""
+        
+        if sensor_type == 1:  # 温度
+            computed_value = raw_value
+            rate = (window[-1] - window[0]) / max(len(window) * 0.5, 0.1) if len(window) > 1 else 0
+            if raw_value > 35:
+                event_type = "body_heat"
+                description = f"检测到体温！约{raw_value:.1f}°C，你的手好温暖~"
+            elif raw_value < 5:
+                event_type = "freezing"
+                description = f"好冷！温度只有{raw_value:.1f}°C，分子们在发抖呢"
+            elif abs(rate) > 2:
+                event_type = "rapid_temp_change"
+                direction = "升高" if rate > 0 else "降低"
+                description = f"温度在快速{direction}！变化率约{abs(rate):.1f}°C/s"
+                
+        elif sensor_type == 2:  # 光线
+            computed_value = raw_value
+            if raw_value > 10000:
+                event_type = "bright_light"
+                description = f"好亮！光照强度{raw_value:.0f}Lux，像在阳光下"
+            elif raw_value < 10:
+                event_type = "darkness"
+                description = f"好暗！只有{raw_value:.0f}Lux，光精灵们在休息"
+                
+        elif sensor_type == 3:  # 声音
+            # 转换为分贝
+            rms = math.sqrt(sum(v**2 for v in window) / len(window)) if window else raw_value
+            db = 20 * math.log10(max(rms, 0.001) / 0.02) if rms > 0 else 0
+            computed_value = round(db, 1)
+            if db > 80:
+                event_type = "loud_sound"
+                description = f"好大的声音！约{db:.0f}分贝，声波在空气中震荡"
+            elif db < 25:
+                event_type = "silence"
+                description = f"好安静~只有{db:.0f}分贝"
+                
+        elif sensor_type == 4:  # 加速度
+            computed_value = std_dev  # 标准差反映运动剧烈程度
+            if abs(raw_value) < 0.5:
+                event_type = "freefall_detected"
+                description = f"自由落体！加速度接近0，重力在作用！"
+            elif std_dev > 5:
+                event_type = "shaking"
+                description = f"检测到剧烈摇晃！加速度波动很大"
+            elif abs(raw_value - 9.8) < 0.5 and std_dev < 0.3:
+                event_type = "still"
+                description = "静止状态，重力加速度约9.8m/s²"
+                
+        elif sensor_type == 5:  # 距离
+            computed_value = raw_value
+            if raw_value < 10:
+                event_type = "very_close"
+                description = f"非常近！只有{raw_value:.1f}cm"
+            elif raw_value > 300:
+                event_type = "far_away"
+                description = f"很远！{raw_value:.1f}cm，超声波飞了很久"
+                
+        elif sensor_type == 6:  # 湿度
+            computed_value = raw_value
+            if raw_value > 80:
+                event_type = "very_humid"
+                description = f"空气好潮湿！{raw_value:.0f}%RH，水精灵们在跳舞"
+            elif raw_value < 20:
+                event_type = "very_dry"
+                description = f"空气很干燥，只有{raw_value:.0f}%RH"
+                
+        elif sensor_type == 7:  # 气压
+            # 计算估算海拔
+            altitude = 44330 * (1 - (raw_value / 1013.25) ** (1/5.255))
+            computed_value = round(altitude, 1)
+            if raw_value < 900:
+                event_type = "high_altitude"
+                description = f"气压较低！估算海拔约{altitude:.0f}米"
+            else:
+                description = f"气压{raw_value:.1f}hPa，估算海拔{altitude:.0f}米"
+                
+        elif sensor_type == 8:  # 磁场
+            computed_value = abs(raw_value)
+            if abs(raw_value) > 60:
+                event_type = "strong_magnetic"
+                description = f"检测到强磁场！{abs(raw_value):.1f}μT，附近有磁铁"
+            elif abs(raw_value) < 10:
+                event_type = "weak_magnetic"
+                description = f"磁场很弱，只有{abs(raw_value):.1f}μT"
+        
+        return {
+            "sensor_type": sensor_type,
+            "sensor_name": reading.get("sensor_name", ""),
+            "raw_value": raw_value,
+            "calibrated_value": round(raw_value, 3),
+            "computed_value": round(computed_value, 3),
+            "unit": reading.get("unit", ""),
+            "event_type": event_type,
+            "description": description,
+            "statistics": {
+                "average": round(avg, 3),
+                "std_dev": round(std_dev, 3),
+                "trend": round(trend, 3),
+                "window_size": len(window)
+            },
+            "timestamp": reading.get("timestamp", "")
+        }
+    
+    def _std_dev(self, data):
+        avg = sum(data) / len(data)
+        variance = sum((x - avg) ** 2 for x in data) / len(data)
+        return math.sqrt(variance)
+    
+    def _trend(self, data):
+        """简单线性趋势（正=上升，负=下降）"""
+        n = len(data)
+        if n < 2:
+            return 0
+        x_mean = (n - 1) / 2
+        y_mean = sum(data) / n
+        num = sum((i - x_mean) * (data[i] - y_mean) for i in range(n))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        return num / den if den != 0 else 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # VM2
+        # 创建通信协议模块
+        """
+
+自定义通信协议编解码
+模拟ESP32和APP之间的二进制通信协议
+在demo中使用JSON简化，但保留协议结构
+"""
+import json
+import hashlib
+from datetime import datetime
+
+class ProtocolCodec:
+    # 帧类型
+    FRAME_SENSOR_DATA = 0x01
+    FRAME_EVENT = 0x02
+    FRAME_HEARTBEAT = 0xFF
+    FRAME_ACHIEVEMENT = 0x20
+    
+
+    def encode(self, processed_packet):
+        """将处理后的数据编码为传输格式"""
+        frame = {
+            "head": "AA55",
+            "type": self.FRAME_SENSOR_DATA,
+            "payload": processed_packet,
+            "crc": self._calc_crc(json.dumps(processed_packet)),
+            "tail": "FE",
+            "encoded_at": datetime.now().isoformat()
+        }
+        return json.dumps(frame)
+    
+    def encode_heartbeat(self, system_state):
+        """编码心跳包"""
+        frame = {
+            "head": "AA55",
+            "type": self.FRAME_HEARTBEAT,
+            "payload": {
+                "sensor_connected": system_state.get("sensor_connected", False),
+                "active_sensors": system_state.get("active_sensors", []),
+                "total_processed": system_state.get("total_processed", 0),
+                "events_detected": system_state.get("events_detected", 0),
+                "offline_mode": system_state.get("offline_mode", False),
+            },
+            "crc": "heartbeat",
+            "tail": "FE",
+            "encoded_at": datetime.now().isoformat()
+        }
+        return json.dumps(frame)
+    
+    def decode(self, raw_message):
+        """解码接收到的消息"""
+        try:
+            frame = json.loads(raw_message)
+            if frame.get("head") != "AA55" or frame.get("tail") != "FE":
+                return None
+            return {
+                "type": frame.get("type"),
+                "payload": frame.get("payload"),
+                "valid": True
+            }
+        except json.JSONDecodeError:
+            return None
+    
+    def _calc_crc(self, data_str):
+        """简化的CRC计算"""
+        return hashlib.md5(data_str.encode()).hexdigest()[:8]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# VM2
+
+        # 创建离线缓存模块
+        """
+
+离线缓存系统
+在APP断连时缓存数据，重连后自动同步
+"""
+import threading
+import json
+from collections import deque
+
+class OfflineCache:
+    def __init__(self, max_size=500):
+        self.max_size = max_size
+        self.cache = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+    
+
+    def store(self, data):
+        with self.lock:
+            self.cache.append(data)
+    
+    def get_all(self):
+        with self.lock:
+            items = list(self.cache)
+            return items
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+    
+    def count(self):
+        with self.lock:
+            return len(self.cache)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            # VM3-上位机APP
+            # 创建COZE客户端模块
+
+"""
+COZE 智能体 API 客户端
+负责与COZE云端AI进行通信
+"""
+import requests
+import json
+import time
+
+class CozeClient:
+    def __init__(self, bot_id, api_token, api_base="https://api.coze.cn"):
+        self.bot_id = bot_id
+        self.api_token = api_token
+        self.api_base = api_base
+        self.conversation_id = None
+        self.user_id = "child_explorer_001"
+        
+
+    def chat(self, message, sensor_context=None, game_state=None):
+        """
+        发送消息给COZE智能体并获取回复
+        
+        参数:
+            message: 用户消息或系统事件描述
+            sensor_context: 传感器上下文信息
+            game_state: 当前游戏状态
+        """
+        url = f"{self.api_base}/v3/chat"
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # 构建带传感器上下文的消息
+        enhanced_message = message
+        if sensor_context:
+            enhanced_message += f"\n\n[传感器上下文]\n{json.dumps(sensor_context, ensure_ascii=False)}"
+        if game_state:
+            enhanced_message += f"\n\n[游戏状态]\n{json.dumps(game_state, ensure_ascii=False)}"
+        
+        body = {
+            "bot_id": self.bot_id,
+            "user_id": self.user_id,
+            "stream": False,
+            "auto_save_history": True,
+            "additional_messages": [
+                {
+                    "role": "user",
+                    "content": enhanced_message,
+                    "content_type": "text"
+                }
+            ]
+        }
+        
+        if self.conversation_id:
+            body["conversation_id"] = self.conversation_id
+        
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # 保存conversation_id用于多轮对话
+                if data.get("data", {}).get("conversation_id"):
+                    self.conversation_id = data["data"]["conversation_id"]
+                
+                # 轮询获取结果
+                chat_id = data.get("data", {}).get("id")
+                if chat_id:
+                    return self._poll_result(chat_id)
+                    
+                return {
+                    "success": True,
+                    "reply": data.get("data", {}).get("content", "小光正在思考中..."),
+                    "raw": data
+                }
+            else:
+                return {
+                    "success": False,
+                    "reply": f"AI暂时无法回应 (HTTP {response.status_code})",
+                    "error": response.text
+                }
+                
+        except requests.exceptions.Timeout:
+            return {"success": False, "reply": "小光思考太久了，请再试一次~"}
+        except requests.exceptions.ConnectionError:
+            return {"success": False, "reply": "无法连接到AI服务器，请检查网络"}
+        except Exception as e:
+            return {"success": False, "reply": f"出了点小问题: {str(e)}"}
+    
+    def _poll_result(self, chat_id):
+        """轮询获取聊天结果"""
+        url = f"{self.api_base}/v3/chat/retrieve"
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        
+        for _ in range(30):  # 最多等30秒
+            try:
+                response = requests.post(url, headers=headers, json={
+                    "chat_id": chat_id,
+                    "conversation_id": self.conversation_id
+                }, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    status = data.get("data", {}).get("status")
+                    
+                    if status == "completed":
+                        # 获取消息列表
+                        return self._get_messages(chat_id)
+                    elif status == "failed":
+                        return {"success": False, "reply": "小光遇到了困难，请再试一次"}
+                
+                time.sleep(1)
+            except:
+                time.sleep(1)
+        
+        return {"success": False, "reply": "小光思考了很久，请再试一次"}
+    
+    def _get_messages(self, chat_id):
+        """获取聊天消息列表"""
+        url = f"{self.api_base}/v3/chat/message/list"
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json={
+                "chat_id": chat_id,
+                "conversation_id": self.conversation_id
+            }, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                messages = data.get("data", [])
+                
+                # 找到AI的回复
+                for msg in messages:
+                    if msg.get("role") == "assistant" and msg.get("type") == "answer":
+                        return {
+                            "success": True,
+                            "reply": msg.get("content", ""),
+                        }
+            
+            return {"success": False, "reply": "小光的回复走丢了..."}
+            
+        except Exception as e:
+            return {"success": False, "reply": f"获取回复失败: {str(e)}"}
+
+
+class CozeClientMock:
+    """
+    COZE 模拟客户端
+    在没有真实API Token时使用，用预设回复模拟AI行为
+    """
+    def __init__(self):
+        self.conversation_history = []
+        self.chapter = 1
+        self.knowledge_points = []
+        
+
+        # 预设的AI回复模板
+        self.event_responses = {
+            "freefall_detected": {
+                "reply": "🍎 哇！你刚才让东西自由落体了！你知道吗，很久很久以前，有一个叫牛顿的魔法学徒坐在苹果树下，一颗苹果砸到了他的头上。他没有生气，反而好奇地想：为什么苹果往下掉，而不是飞上天呢？\n\n他发现了重力——一种看不见的力量，它让所有东西都想往地球中心跑！你刚才测到的加速度接近9.8m/s²，这就是地球给所有东西的'拉力'哦！",
+                "medal": {"id": "newton_apple", "name": "🍎 牛顿的苹果", "rarity": "⭐⭐ 稀有"},
+                "knowledge": "重力加速度约9.8m/s²，所有物体自由落体时加速度相同"
+            },
+            "body_heat": {
+                "reply": "🔥 哇，温度升高了！你是不是用手握住了传感器呀？你的体温大约是37°C，比空气要暖和多了。\n\n你知道吗，有一个叫焦耳的科学家发现：能量可以从一种形式变成另一种！你手上的热量就是从你吃的食物变来的——食物的化学能 → 你身体的热能。太神奇了！",
+                "medal": {"id": "joule_flame", "name": "🔥 焦耳的火焰", "rarity": "⭐⭐ 稀有"},
+                "knowledge": "能量守恒定律：能量不会消失，只会从一种形式转化为另一种"
+            },
+            "freezing": {
+                "reply": "❄️ 好冷呀！温度降到很低了。你知道世界上最冷最冷的温度是多少吗？\n\n-273.15°C！这个温度叫做'绝对零度'，在这个温度下，连最活泼的小分子都会停下来不动了。就像把所有的小精灵都冻住了一样！一个叫开尔文的科学家国王制定了这个法律。",
+                "medal": {"id": "kelvin_ice", "name": "❄️ 开尔文的冰晶", "rarity": "⭐ 普通"},
+                "knowledge": "绝对零度是-273.15°C，分子热运动完全停止的理论最低温度"
+            },
+            "loud_sound": {
+                "reply": "🔊 好大的声音！你知道声音是怎么传播的吗？\n\n声音就像水面上的波纹一样！你说话、拍手或者唱歌，都会让空气产生一种看不见的波——声波。声波传到我们的耳朵里，就听到声音了。赫兹先生专门研究了这些波，所以我们用'赫兹'来纪念他！",
+                "medal": {"id": "hertz_ripple", "name": "🔔 赫兹的波纹", "rarity": "⭐ 普通"},
+                "knowledge": "声音是一种机械波，通过空气等介质传播，速度约340m/s"
+            },
+            "bright_light": {
+                "reply": "💡 好亮啊！你知道吗，爱迪生为了发明灯泡，尝试了超过1000种材料做灯丝！\n\n有人问他失败了那么多次不难过吗？他说：'我没有失败，我只是找到了1000种不能做灯丝的材料！'最后他成功了，从此人类的夜晚变得明亮起来。坚持就是胜利！",
+                "medal": {"id": "edison_bulb", "name": "💡 爱迪生的灯泡", "rarity": "⭐ 普通"},
+                "knowledge": "光是一种电磁波，光照强度用勒克斯(Lux)衡量"
+            },
+            "strong_magnetic": {
+                "reply": "🧲 检测到强磁场！你是不是拿了磁铁过来？\n\n在古老的中国，一位叫沈括的科学家发现，把磁石磨成针放在水上，它会自动指向南方——这就是指南针！有了它，航海家们再也不会在大海上迷路了。你现在感受到的就是地球巨大磁场的一小部分哦！",
+                "medal": {"id": "shenkuo_compass", "name": "🧭 沈括的指南针", "rarity": "⭐⭐ 稀有"},
+                "knowledge": "地球是一个巨大的磁铁，有南北两个磁极"
+            },
+            "shaking": {
+                "reply": "🏃 你在摇晃设备呢！加速度在不断变化。\n\n当你晃动东西时，你在给它施加力，让它改变运动方向。牛顿说过：力可以改变物体的运动状态。你施加的力越大，加速度就越大。这就是著名的牛顿第二定律——F=ma！",
+                "knowledge": "牛顿第二定律：合力等于质量乘以加速度"
+            },
+            "very_humid": {
+                "reply": "💧 空气好潮湿啊！水精灵们在空气中飞舞呢！\n\n你知道水精灵们一直在旅行吗？太阳把海洋的水蒸发到天上变成云，云飘到高处变成雨落下来，雨水流进河里再回到海洋。这就是大自然的'水循环'！当空气中水精灵很多的时候，我们就说湿度很高。",
+                "knowledge": "水循环：蒸发→凝结→降水→汇流→蒸发"
+            },
+        }
+        
+        self.general_responses = [
+            "小探索家，试试用手握住温度传感器，看看温度会不会变化！🌡️",
+            "你要不要试试对着声音传感器拍手？看看声音有多大！👏",
+            "把设备举高再放开，看看加速度传感器能不能检测到自由落体！🍎",
+            "遮住光线传感器看看会发生什么？然后对着灯光照照呢？💡",
+            "每一次探索，你都在发现世界的秘密！继续加油！🌟",
+        ]
+        self.general_idx = 0
+    
+    def chat(self, message, sensor_context=None, game_state=None):
+        """模拟AI对话"""
+        # 检查是否是传感器事件触发的对话
+        if sensor_context:
+            events = sensor_context.get("events", [])
+            for event in events:
+                event_type = event.get("event_type", "none")
+                if event_type in self.event_responses:
+                    resp = self.event_responses[event_type]
+                    return {
+                        "success": True,
+                        "reply": resp["reply"],
+                        "medal": resp.get("medal"),
+                        "knowledge": resp.get("knowledge"),
+                    }
+        
+        # 普通对话
+        # 根据关键词匹配回复
+        msg_lower = message.lower()
+        
+        if any(w in msg_lower for w in ["你好", "嗨", "hello", "开始"]):
+            return {
+                "success": True,
+                "reply": "🌟 你好呀，小探索家！我是探索精灵·小光！我住在知识结晶世界里，这个世界是由人类所有的科学发现构成的。\n\n但是最近，'遗忘之雾'开始侵蚀我们的世界了！只有当你用传感器探索物理世界的秘密时，知识结晶才会发光，驱散迷雾。\n\n准备好了吗？让我们开始探险吧！先试试连接一个传感器看看？"
+            }
+        elif any(w in msg_lower for w in ["传感器", "怎么用", "教我"]):
+            return {
+                "success": True,
+                "reply": "📡 传感器就像是超级感官！我们人类有眼睛看光、耳朵听声音、皮肤感受温度，传感器也一样，但它更精确哦！\n\n比如温度传感器可以精确到0.1°C，比你的手指灵敏多了！试试插入一个传感器，然后用它去探索身边的世界吧。"
+            }
+        elif any(w in msg_lower for w in ["勋章", "图鉴", "收集"]):
+            return {
+                "success": True,
+                "reply": "🏅 每当你发现一个重要的物理现象，就会解锁一枚知识勋章！每枚勋章背后都有一个科学家的故事。\n\n已经解锁的勋章可以在图鉴里查看。有些勋章很稀有，需要同时使用多种传感器才能解锁哦！加油收集吧！"
+            }
+        elif any(w in msg_lower for w in ["重力", "掉落", "苹果", "落体"]):
+            return {
+                "success": True,
+                "reply": "🍎 你对重力感兴趣吗？太好了！试试这个：把加速度传感器（ID:4）插入，然后轻轻举起设备再松手（注意别摔坏了哦！），看看传感器检测到什么！\n\n牛顿在苹果树下发现了重力的秘密，你也可以！"
+            }
+        elif any(w in msg_lower for w in ["温度", "热", "冷"]):
+            return {
+                "success": True,
+                "reply": "🌡️ 温度探索真有趣！试试这些：\n1. 用手握住传感器——感受体温的温暖\n2. 对传感器哈一口气——热气会让温度升高\n3. 把传感器靠近冰块——感受寒冷\n\n看看你能触发什么特殊事件！"
+            }
+        elif any(w in msg_lower for w in ["声音", "听", "唱歌", "拍手"]):
+            return {
+                "success": True,
+                "reply": "🔊 声音的世界好丰富！插入声音传感器（ID:3），然后试试：轻轻说话、大声喊叫、拍手、敲桌子……\n\n每种声音的大小都不一样，传感器会用'分贝'来衡量。正常说话大约60分贝，摇滚音乐会超过100分贝！"
+            }
+        else:
+            # 循环使用通用回复
+            reply = self.general_responses[self.general_idx % len(self.general_responses)]
+            self.general_idx += 1
+            return {"success": True, "reply": reply}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# VM3
+
+# 创建Flask后端服务
+
+#!/usr/bin/env python3
+
+"""
+====================================================
+
+VM3 - 上位机APP后端
+====================================================
+
+Flask 服务器，作为移动APP的模拟
+
+- 接收ESP32传来的传感器数据
+
+- 调用COZE AI进行对话
+
+- 提供Web前端界面
+  ====================================================
+
+  """
+
+import socket
+import threading
+import json
+import time
+import queue
+from datetime import datetime
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
+from coze_client import CozeClient, CozeClientMock
+
+# ========== 配置 ==========
+
+ESP32_IP = "192.168.110.129"   # ← 替换为VM2的实际IP
+ESP32_PORT = 9002
+WEB_PORT = 8080
+
+# COZE API 配置（如果有的话）
+
+COZE_BOT_ID = "7627689802107994166"       # ← 替换为你的COZE Bot ID
+COZE_API_TOKEN = "pat_WthcSui7hzejyAz2xYcrbnqsRpwGeWm4gFbPUappyVmlK7TKJbPLIC11EGeQVnD0"  # ← 替换为你的COZE API Token
+
+# ========== Flask App ==========
+
+app = Flask(__name__)
+CORS(app)
+
+# ========== 全局状态 ==========
+
+app_state = {
+    "esp32_connected": False,
+    "sensor_data": [],           # 最新传感器数据
+    "sensor_history": {},        # 传感器历史数据（用于图表）
+    "events": [],                # 检测到的事件
+    "medals": [],                # 已解锁的勋章
+    "chat_history": [],          # 对话历史
+    "system_status": {},         # ESP32系统状态
+    "knowledge_points": [],      # 已学到的知识点
+}
+state_lock = threading.Lock()
+
+# 最新数据队列（给前端实时推送用）
+
+latest_data_queue = queue.Queue(maxsize=100)
+
+# AI客户端
+
+# 如果有COZE API Token就用真实客户端，否则用模拟客户端
+
+if COZE_API_TOKEN != "pat_WthcSui7hzejyAz2xYcrbnqsRpwGeWm4gFbPUappyVmlK7TKJbPLIC11EGeQVnD0" and COZE_BOT_ID != "7627689802107994166":
+    ai_client = CozeClient(bot_id=COZE_BOT_ID, api_token=COZE_API_TOKEN)
+    print("🤖 使用 COZE 真实AI客户端")
+else:
+    ai_client = CozeClientMock()
+    print("🤖 使用 COZE 模拟AI客户端（无需API Token，使用预设回复）")
+
+
+# ================================================================
+
+# ESP32 数据接收线程
+
+# ================================================================
+
+def esp32_receiver():
+    """持续连接ESP32并接收数据"""
+    while True:
+        try:
+            print(f"\n📡 正在连接ESP32 ({ESP32_IP}:{ESP32_PORT})...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((ESP32_IP, ESP32_PORT))
+            
+
+            with state_lock:
+                app_state["esp32_connected"] = True
+            print(f"✅ 已连接到ESP32")
+            
+            buffer = ""
+            while True:
+                try:
+                    data = sock.recv(4096).decode('utf-8')
+                    if not data:
+                        break
+                    
+                    buffer += data
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        try:
+                            frame = json.loads(line)
+                            process_esp32_frame(frame)
+                        except json.JSONDecodeError:
+                            pass
+                            
+                except socket.timeout:
+                    continue
+                    
+        except (ConnectionRefusedError, OSError) as e:
+            with state_lock:
+                app_state["esp32_connected"] = False
+            print(f"⏳ 等待ESP32连接... ({e})")
+            time.sleep(3)
+        except Exception as e:
+            with state_lock:
+                app_state["esp32_connected"] = False
+            print(f"❌ ESP32连接错误: {e}")
+            time.sleep(3)
+
+
+def process_esp32_frame(frame):
+    """处理从ESP32收到的数据帧"""
+    frame_type = frame.get("type")
+    payload = frame.get("payload")
+    
+
+    if not payload:
+        return
+    
+    if frame_type == 0x01:  # 传感器数据
+        results = payload.get("results", [])
+        
+        with state_lock:
+            app_state["sensor_data"] = results
+            
+            # 更新历史记录
+            for r in results:
+                stype = r.get("sensor_type", 0)
+                if stype not in app_state["sensor_history"]:
+                    app_state["sensor_history"][stype] = []
+                app_state["sensor_history"][stype].append({
+                    "value": r.get("calibrated_value", 0),
+                    "computed": r.get("computed_value", 0),
+                    "time": datetime.now().strftime("%H:%M:%S")
+                })
+                # 只保留最近100个数据点
+                if len(app_state["sensor_history"][stype]) > 100:
+                    app_state["sensor_history"][stype] = app_state["sensor_history"][stype][-100:]
+                
+                # 检测事件
+                event_type = r.get("event_type", "none")
+                if event_type != "none":
+                    event_data = {
+                        "type": event_type,
+                        "description": r.get("description", ""),
+                        "sensor": r.get("sensor_name", ""),
+                        "value": r.get("calibrated_value", 0),
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    }
+                    app_state["events"].insert(0, event_data)
+                    app_state["events"] = app_state["events"][:50]  # 保留最近50个
+                    
+                    # 自动触发AI对话
+                    auto_ai_respond(event_data, r)
+        
+        # 放入实时队列
+        if not latest_data_queue.full():
+            latest_data_queue.put(results, block=False)
+    
+    elif frame_type == 0xFF:  # 心跳包
+        with state_lock:
+            app_state["system_status"] = payload
+
+
+def auto_ai_respond(event_data, sensor_result):
+    """事件触发时自动请求AI回复"""
+    try:
+        sensor_context = {
+            "events": [event_data],
+            "latest_reading": {
+                "sensor_type": sensor_result.get("sensor_type"),
+                "value": sensor_result.get("calibrated_value"),
+                "unit": sensor_result.get("unit")
+            }
+        }
+        
+
+        response = ai_client.chat(
+            f"传感器检测到事件: {event_data['description']}",
+            sensor_context=sensor_context
+        )
+        
+        if response.get("success"):
+            with state_lock:
+                # 添加AI回复到聊天历史
+                app_state["chat_history"].append({
+                    "role": "system",
+                    "content": f"🎯 事件触发: {event_data['description']}",
+                    "time": datetime.now().strftime("%H:%M:%S")
+                })
+                app_state["chat_history"].append({
+                    "role": "assistant",
+                    "content": response["reply"],
+                    "time": datetime.now().strftime("%H:%M:%S")
+                })
+                
+                # 检查勋章
+                if response.get("medal"):
+                    medal = response["medal"]
+                    if medal["id"] not in [m["id"] for m in app_state["medals"]]:
+                        app_state["medals"].append(medal)
+                        app_state["chat_history"].append({
+                            "role": "medal",
+                            "content": f"🏅 解锁勋章: {medal['name']} ({medal['rarity']})",
+                            "time": datetime.now().strftime("%H:%M:%S")
+                        })
+                
+                # 记录知识点
+                if response.get("knowledge"):
+                    app_state["knowledge_points"].append({
+                        "content": response["knowledge"],
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    })
+                
+    except Exception as e:
+        print(f"⚠️ AI自动回复异常: {e}")
+
+
+# ================================================================
+
+# Flask 路由
+
+# ================================================================
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/state')
+def get_state():
+    """获取当前完整状态"""
+    with state_lock:
+        return jsonify(app_state)
+
+@app.route('/api/sensor_data')
+def get_sensor_data():
+    """获取最新传感器数据"""
+    with state_lock:
+        return jsonify({
+            "data": app_state["sensor_data"],
+            "history": app_state["sensor_history"]
+        })
+
+@app.route('/api/events')
+def get_events():
+    """获取事件列表"""
+    with state_lock:
+        return jsonify(app_state["events"])
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """用户手动发送消息给AI"""
+    user_message = request.json.get("message", "")
+    
+
+    if not user_message.strip():
+        return jsonify({"success": False, "reply": "请输入消息"})
+    
+    # 记录用户消息
+    with state_lock:
+        app_state["chat_history"].append({
+            "role": "user",
+            "content": user_message,
+            "time": datetime.now().strftime("%H:%M:%S")
+        })
+        current_sensors = app_state["sensor_data"]
+    
+    # 调用AI
+    sensor_context = {
+        "latest_readings": current_sensors,
+        "active_sensors": [d.get("sensor_name") for d in current_sensors]
+    }
+    
+    response = ai_client.chat(user_message, sensor_context=sensor_context)
+    
+    with state_lock:
+        app_state["chat_history"].append({
+            "role": "assistant",
+            "content": response.get("reply", "..."),
+            "time": datetime.now().strftime("%H:%M:%S")
+        })
+        
+        if response.get("medal"):
+            medal = response["medal"]
+            if medal["id"] not in [m["id"] for m in app_state["medals"]]:
+                app_state["medals"].append(medal)
+        
+        if response.get("knowledge"):
+            app_state["knowledge_points"].append({
+                "content": response["knowledge"],
+                "time": datetime.now().strftime("%H:%M:%S")
+            })
+    
+    return jsonify(response)
+
+@app.route('/api/medals')
+def get_medals():
+    """获取已解锁勋章"""
+    with state_lock:
+        return jsonify(app_state["medals"])
+
+@app.route('/api/chat_history')
+def get_chat_history():
+    """获取聊天历史"""
+    with state_lock:
+        return jsonify(app_state["chat_history"][-50:])
+
+@app.route('/api/knowledge')
+def get_knowledge():
+    """获取已学知识点"""
+    with state_lock:
+        return jsonify(app_state["knowledge_points"])
+
+
+# ================================================================
+
+# 启动
+
+# ================================================================
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("    📱 VM3 - 上位机APP模拟器")
+    print("    模拟移动端APP界面和AI交互")
+    print("=" * 60)
+    
+
+    # 启动ESP32数据接收线程
+    esp32_thread = threading.Thread(target=esp32_receiver, daemon=True)
+    esp32_thread.start()
+    
+    print(f"\n🌐 Web界面: http://localhost:{WEB_PORT}")
+    print(f"   也可在其他电脑用 http://VM3的IP:{WEB_PORT} 访问")
+    
+    app.run(host='0.0.0.0', port=WEB_PORT, debug=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # VM3
+    # 创建前端界面（templates/index.html）
+    <!DOCTYPE html>
+
+<html lang="zh-CN">
+
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🔬 探索精灵·小光 — 知识结晶世界</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0b0f2a;--card:#141937;--card-hover:#1b2247;
+  --blue:#4f8cff;--purple:#a855f7;--green:#22c55e;--orange:#f59e0b;
+  --red:#ef4444;--pink:#ec4899;--cyan:#06b6d4;
+  --text:#e2e8f0;--text2:#94a3b8;--border:rgba(255,255,255,0.07);
+}
+body{font-family:'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+
+
+/* Layout */
+.app-container{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr;gap:12px;padding:12px;height:100vh;max-height:100vh}
+.header{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:var(--card);border-radius:14px;border:1px solid var(--border)}
+.header h1{font-size:1.2rem;font-weight:800;background:linear-gradient(135deg,var(--blue),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.status-badges{display:flex;gap:8px}
+.badge{padding:4px 12px;border-radius:8px;font-size:0.72rem;font-weight:600;display:flex;align-items:center;gap:4px}
+.badge-ok{background:rgba(34,197,94,0.15);color:#86efac;border:1px solid rgba(34,197,94,0.3)}
+.badge-err{background:rgba(239,68,68,0.15);color:#fca5a5;border:1px solid rgba(239,68,68,0.3)}
+.badge-info{background:rgba(79,140,255,0.15);color:#93bbff;border:1px solid rgba(79,140,255,0.3)}
+
+/* Panels */
+.panel{background:var(--card);border-radius:14px;border:1px solid var(--border);overflow:hidden;display:flex;flex-direction:column}
+.panel-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-weight:700;font-size:0.9rem;flex-shrink:0}
+.panel-body{flex:1;overflow-y:auto;padding:12px 16px}
+
+/* Sensor Panel */
+.sensor-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.sensor-card{padding:12px;border-radius:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border);transition:all 0.3s}
+.sensor-card.active{border-color:rgba(34,197,94,0.4);background:rgba(34,197,94,0.05)}
+.sensor-card.event{border-color:rgba(245,158,11,0.5);background:rgba(245,158,11,0.08);animation:pulse 1s ease-in-out}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
+.sensor-icon{font-size:1.3rem;margin-bottom:4px}
+.sensor-name{font-size:0.72rem;color:var(--text2);margin-bottom:4px}
+.sensor-value{font-size:1.1rem;font-weight:800}
+.sensor-unit{font-size:0.7rem;color:var(--text2);margin-left:2px}
+.sensor-event{font-size:0.68rem;color:var(--orange);margin-top:4px;min-height:16px}
+
+/* Chat Panel */
+.chat-messages{display:flex;flex-direction:column;gap:10px}
+.chat-msg{padding:10px 14px;border-radius:12px;font-size:0.84rem;line-height:1.6;max-width:90%;animation:msgIn 0.3s ease}
+@keyframes msgIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.msg-user{background:rgba(79,140,255,0.15);border:1px solid rgba(79,140,255,0.2);align-self:flex-end;border-bottom-right-radius:4px}
+.msg-assistant{background:rgba(168,85,247,0.1);border:1px solid rgba(168,85,247,0.2);align-self:flex-start;border-bottom-left-radius:4px}
+.msg-system{background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.2);align-self:center;font-size:0.75rem;text-align:center}
+.msg-medal{background:linear-gradient(135deg,rgba(245,158,11,0.15),rgba(236,72,153,0.15));border:1px solid rgba(245,158,11,0.3);align-self:center;text-align:center;font-weight:700;font-size:0.9rem}
+.msg-time{font-size:0.65rem;color:var(--text2);margin-top:4px}
+
+.chat-input-row{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-shrink:0}
+.chat-input{flex:1;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,0.05);color:var(--text);font-family:inherit;font-size:0.85rem;outline:none;transition:border-color 0.3s}
+.chat-input:focus{border-color:var(--blue)}
+.chat-send{padding:10px 20px;border:none;border-radius:10px;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;font-family:inherit;font-weight:700;font-size:0.85rem;cursor:pointer;transition:transform 0.2s}
+.chat-send:hover{transform:scale(1.05)}
+.chat-send:active{transform:scale(0.95)}
+.voice-btn{padding:10px;border:1px solid var(--border);border-radius:10px;background:transparent;color:var(--text2);font-size:1.1rem;cursor:pointer;transition:all 0.3s}
+.voice-btn.recording{background:rgba(239,68,68,0.2);border-color:var(--red);color:var(--red);animation:pulse 0.8s infinite}
+
+/* Event Log */
+.event-item{padding:8px 12px;border-radius:8px;margin-bottom:6px;background:rgba(255,255,255,0.03);border-left:3px solid var(--orange);font-size:0.78rem}
+.event-item .event-time{font-size:0.65rem;color:var(--text2)}
+.event-item .event-sensor{color:var(--cyan);font-weight:600}
+.event-item .event-desc{color:var(--text);margin-top:2px}
+
+/* Medal Gallery */
+.medal-list{display:flex;flex-wrap:wrap;gap:8px}
+.medal-item{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border)}
+.medal-item .medal-icon-big{font-size:1.5rem}
+.medal-item .medal-info .medal-n{font-size:0.82rem;font-weight:700}
+.medal-item .medal-info .medal-r{font-size:0.68rem;color:var(--orange)}
+
+/* Knowledge Board */
+.knowledge-item{padding:8px 12px;border-radius:8px;margin-bottom:6px;background:rgba(168,85,247,0.08);border:1px solid rgba(168,85,247,0.15);font-size:0.8rem;line-height:1.5}
+.knowledge-item .k-time{font-size:0.65rem;color:var(--text2)}
+
+/* Tabs in panel */
+.panel-tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
+.panel-tab{flex:1;padding:8px;text-align:center;font-size:0.78rem;font-weight:600;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.3s}
+.panel-tab:hover{color:var(--text)}
+.panel-tab.active{color:var(--blue);border-bottom-color:var(--blue)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:2px}
+
+/* Empty state */
+.empty-state{text-align:center;padding:30px;color:var(--text2);font-size:0.85rem}
+.empty-state .empty-icon{font-size:2rem;margin-bottom:8px}
+
+@media(max-width:768px){
+  .app-container{grid-template-columns:1fr;grid-template-rows:auto auto 1fr}
+  .sensor-grid{grid-template-columns:repeat(4,1fr)}
+}
+</style>
+</head>
+<body>
+
+<div class="app-container">
+  <!-- Header -->
+  <div class="header">
+    <h1>🔬 探索精灵·小光 — 知识结晶世界</h1>
+    <div class="status-badges">
+      <span id="badge-esp32" class="badge badge-err">🔴 ESP32 未连接</span>
+      <span id="badge-sensors" class="badge badge-info">🔌 传感器: 0</span>
+      <span id="badge-medals" class="badge badge-info">🏅 勋章: 0</span>
+      <span id="badge-knowledge" class="badge badge-info">📚 知识点: 0</span>
+    </div>
+  </div>
+
+
+  <!-- Left: Sensor + Events -->
+
+  <div class="panel">
+    <div class="panel-tabs">
+      <div class="panel-tab active" onclick="switchLeftTab('sensors')">📡 传感器</div>
+      <div class="panel-tab" onclick="switchLeftTab('events')">🎯 事件</div>
+      <div class="panel-tab" onclick="switchLeftTab('medals')">🏅 勋章</div>
+      <div class="panel-tab" onclick="switchLeftTab('knowledge')">📚 知识</div>
+    </div>
+    <div class="panel-body">
+      <!-- Sensors Tab -->
+      <div id="tab-sensors" class="tab-panel active">
+        <div class="sensor-grid" id="sensorGrid">
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            等待传感器数据...
+          </div>
+        </div>
+      </div>
+      <!-- Events Tab -->
+      <div id="tab-events" class="tab-panel">
+        <div id="eventList">
+          <div class="empty-state">
+            <div class="empty-icon">🎯</div>
+            还没有检测到事件<br>试试操作传感器！
+          </div>
+        </div>
+      </div>
+      <!-- Medals Tab -->
+      <div id="tab-medals" class="tab-panel">
+        <div class="medal-list" id="medalList">
+          <div class="empty-state">
+            <div class="empty-icon">🏅</div>
+            还没有解锁勋章<br>触发传感器事件来收集！
+          </div>
+        </div>
+      </div>
+      <!-- Knowledge Tab -->
+      <div id="tab-knowledge" class="tab-panel">
+        <div id="knowledgeList">
+          <div class="empty-state">
+            <div class="empty-icon">📚</div>
+            知识面板<br>探索越多，知识越丰富！
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- Right: Chat with AI -->
+
+  <div class="panel" style="display:flex;flex-direction:column">
+    <div class="panel-header">💬 与小光对话</div>
+    <div class="panel-body" id="chatMessages" style="flex:1">
+      <div class="chat-messages" id="chatContainer">
+        <div class="chat-msg msg-assistant">
+          <div>🌟 你好呀，小探索家！我是探索精灵·小光！<br><br>
+          我住在知识结晶世界里。快连接传感器，和我一起探索物理世界的奇妙吧！<br><br>
+          你可以：<br>
+          • 在VM1终端输入 <b>p 4</b> 插入加速度传感器<br>
+          • 输入 <b>e freefall</b> 模拟自由落体<br>
+          • 或者直接和我聊天问问题！</div>
+          <div class="msg-time">系统</div>
+        </div>
+      </div>
+    </div>
+    <div class="chat-input-row">
+      <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()" title="语音输入">🎤</button>
+      <input class="chat-input" id="chatInput" placeholder="和小光说说话..." onkeydown="if(event.key==='Enter')sendMessage()">
+      <button class="chat-send" onclick="sendMessage()">发送 ✨</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ========== 常量 ==========
+const SENSOR_ICONS = {1:'🌡️',2:'💡',3:'🔊',4:'🏃',5:'📏',6:'💧',7:'🌀',8:'🧲'};
+const SENSOR_NAMES = {1:'温度',2:'光线',3:'声音',4:'加速度',5:'距离',6:'湿度',7:'气压',8:'磁场'};
+
+
+// ========== 状态轮询 ==========
+let pollInterval;
+
+function startPolling() {
+  pollInterval = setInterval(async () => {
+    try {
+      const resp = await fetch('/api/state');
+      const state = await resp.json();
+      updateUI(state);
+    } catch(e) {
+      console.error('轮询失败:', e);
+    }
+  }, 500);
+}
+
+function updateUI(state) {
+  // 更新状态徽章
+  const esp32Badge = document.getElementById('badge-esp32');
+  if (state.esp32_connected) {
+    esp32Badge.className = 'badge badge-ok';
+    esp32Badge.textContent = '🟢 ESP32 已连接';
+  } else {
+    esp32Badge.className = 'badge badge-err';
+    esp32Badge.textContent = '🔴 ESP32 未连接';
+  }
+
+  const activeSensors = (state.sensor_data || []).length;
+  document.getElementById('badge-sensors').textContent = `🔌 传感器: ${activeSensors}`;
+  document.getElementById('badge-medals').textContent = `🏅 勋章: ${(state.medals||[]).length}`;
+  document.getElementById('badge-knowledge').textContent = `📚 知识: ${(state.knowledge_points||[]).length}`;
+
+  // 更新传感器面板
+  updateSensors(state.sensor_data || []);
+
+  // 更新事件列表
+  updateEvents(state.events || []);
+
+  // 更新勋章
+  updateMedals(state.medals || []);
+
+  // 更新知识点
+  updateKnowledge(state.knowledge_points || []);
+
+  // 更新聊天（增量更新）
+  updateChat(state.chat_history || []);
+}
+
+function updateSensors(data) {
+  const grid = document.getElementById('sensorGrid');
+  if (!data.length) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">📡</div>等待传感器数据...<br><small>在VM1中输入 p 1 插入温度传感器</small></div>';
+    return;
+  }
+
+  grid.innerHTML = data.map(d => {
+    const hasEvent = d.event_type && d.event_type !== 'none';
+    const cls = hasEvent ? 'sensor-card active event' : 'sensor-card active';
+    return `
+      <div class="${cls}">
+        <div class="sensor-icon">${SENSOR_ICONS[d.sensor_type] || '❓'}</div>
+        <div class="sensor-name">${d.sensor_name || SENSOR_NAMES[d.sensor_type] || '未知'}</div>
+        <div class="sensor-value">${typeof d.calibrated_value === 'number' ? d.calibrated_value.toFixed(2) : d.calibrated_value}<span class="sensor-unit">${d.unit || ''}</span></div>
+        <div class="sensor-event">${hasEvent ? '⚡ ' + d.description : ''}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function updateEvents(events) {
+  const list = document.getElementById('eventList');
+  if (!events.length) {
+    list.innerHTML = '<div class="empty-state"><div class="empty-icon">🎯</div>还没有检测到事件</div>';
+    return;
+  }
+  list.innerHTML = events.slice(0, 20).map(e => `
+    <div class="event-item">
+      <span class="event-time">${e.time}</span> 
+      <span class="event-sensor">${e.sensor}</span>
+      <div class="event-desc">${e.description}</div>
+    </div>
+  `).join('');
+}
+
+function updateMedals(medals) {
+  const list = document.getElementById('medalList');
+  if (!medals.length) {
+    list.innerHTML = '<div class="empty-state"><div class="empty-icon">🏅</div>还没有解锁勋章</div>';
+    return;
+  }
+  list.innerHTML = medals.map(m => `
+    <div class="medal-item">
+      <span class="medal-icon-big">${m.name.split(' ')[0]}</span>
+      <div class="medal-info">
+        <div class="medal-n">${m.name}</div>
+        <div class="medal-r">${m.rarity}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function updateKnowledge(points) {
+  const list = document.getElementById('knowledgeList');
+  if (!points.length) {
+    list.innerHTML = '<div class="empty-state"><div class="empty-icon">📚</div>知识面板</div>';
+    return;
+  }
+  list.innerHTML = points.map(k => `
+    <div class="knowledge-item">
+      <div class="k-time">${k.time}</div>
+      <div>📖 ${k.content}</div>
+    </div>
+  `).join('');
+}
+
+let lastChatLength = 1; // 初始有一条欢迎消息
+function updateChat(history) {
+  if (history.length <= lastChatLength - 1) return; // 没有新消息（减1是因为初始欢迎消息）
+
+  const container = document.getElementById('chatContainer');
+
+  // 只添加新消息
+  const newMsgs = history.slice(Math.max(0, lastChatLength - 1));
+  for (const msg of newMsgs) {
+    const div = document.createElement('div');
+    let cls = 'msg-assistant';
+    if (msg.role === 'user') cls = 'msg-user';
+    else if (msg.role === 'system') cls = 'msg-system';
+    else if (msg.role === 'medal') cls = 'msg-medal';
+    
+
+    div.className = `chat-msg ${cls}`;
+    div.innerHTML = `<div>${msg.content.replace(/\n/g, '<br>')}</div><div class="msg-time">${msg.time}</div>`;
+    container.appendChild(div);
+
+  }
+
+  lastChatLength = history.length + 1;
+
+  // 滚动到底部
+  const panel = document.getElementById('chatMessages');
+  panel.scrollTop = panel.scrollHeight;
+
+  // 语音朗读最新AI回复
+  if (newMsgs.length > 0) {
+    const lastMsg = newMsgs[newMsgs.length - 1];
+    if (lastMsg.role === 'assistant' && window.speechSynthesis) {
+      speakText(lastMsg.content);
+    }
+  }
+}
+
+// ========== 聊天发送 ==========
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  input.value = '';
+
+  // 立即显示用户消息
+  const container = document.getElementById('chatContainer');
+  const div = document.createElement('div');
+  div.className = 'chat-msg msg-user';
+  div.innerHTML = `<div>${msg}</div><div class="msg-time">发送中...</div>`;
+  container.appendChild(div);
+  document.getElementById('chatMessages').scrollTop = container.scrollHeight;
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: msg})
+    });
+    const data = await resp.json();
+    // 回复会通过状态轮询自动显示
+  } catch(e) {
+    console.error('发送失败:', e);
+  }
+}
+
+// ========== 语音功能 ==========
+let isRecording = false;
+let recognition = null;
+
+function toggleVoice() {
+  if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+    addSystemMsg('⚠️ 你的浏览器不支持语音输入，请使用Chrome浏览器');
+    return;
+  }
+
+  if (isRecording) {
+    stopVoice();
+  } else {
+    startVoice();
+  }
+}
+
+function startVoice() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.lang = 'zh-CN';
+  recognition.continuous = false;
+  recognition.interimResults = false;
+
+  recognition.onresult = (event) => {
+    const text = event.results[0][0].transcript;
+    document.getElementById('chatInput').value = text;
+    sendMessage();
+  };
+
+  recognition.onerror = (event) => {
+    console.error('语音识别错误:', event.error);
+    stopVoice();
+  };
+
+  recognition.onend = () => {
+    stopVoice();
+  };
+
+  recognition.start();
+  isRecording = true;
+  document.getElementById('voiceBtn').classList.add('recording');
+}
+
+function stopVoice() {
+  if (recognition) {
+    recognition.stop();
+  }
+  isRecording = false;
+  document.getElementById('voiceBtn').classList.remove('recording');
+}
+
+function speakText(text) {
+  // 清理文本（去除emoji和特殊字符）
+  const cleanText = text.replace(/[\u{1F300}-\u{1F9FF}]/gu, '').replace(/\n/g, '。').substring(0, 200);
+
+  if ('speechSynthesis' in window && cleanText.trim()) {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.lang = 'zh-CN';
+    utterance.rate = 0.9;
+    utterance.pitch = 1.2; // 稍高的音调，更适合给儿童
+    window.speechSynthesis.speak(utterance);
+  }
+}
+
+function addSystemMsg(text) {
+  const container = document.getElementById('chatContainer');
+  const div = document.createElement('div');
+  div.className = 'chat-msg msg-system';
+  div.innerHTML = `<div>${text}</div>`;
+  container.appendChild(div);
+}
+
+
+
+
+// ========== 左侧面板Tab ==========
+function switchLeftTab(tabName) {
+  document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + tabName).classList.add('active');
+}
+
+// ========== 启动 ==========
+startPolling();
+</script>
+</body>
+</html>
