@@ -207,7 +207,6 @@ class SensorSimulator:
             cycle += 1
             time.sleep(SEND_INTERVAL)
 
-
 def print_help():
     """打印帮助菜单"""
     print("""
