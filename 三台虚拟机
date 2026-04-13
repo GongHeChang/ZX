@@ -1593,12 +1593,14 @@ def process_esp32_frame(frame):
     frame_type = frame.get("type")
     payload = frame.get("payload")
     
-
     if not payload:
         return
     
     if frame_type == 0x01:  # 传感器数据
         results = payload.get("results", [])
+        
+        # ====== 收集需要触发AI的事件（在锁内完成数据更新，但不调用AI） ======
+        pending_ai_events = []
         
         with state_lock:
             app_state["sensor_data"] = results
@@ -1628,10 +1630,14 @@ def process_esp32_frame(frame):
                         "time": datetime.now().strftime("%H:%M:%S")
                     }
                     app_state["events"].insert(0, event_data)
-                    app_state["events"] = app_state["events"][:50]  # 保留最近50个
+                    app_state["events"] = app_state["events"][:50]
                     
-                    # 自动触发AI对话
-                    auto_ai_respond(event_data, r)
+                    # 先收集，不在锁内调用AI
+                    pending_ai_events.append((event_data, r))
+        
+        # ====== 锁已释放，现在安全地调用AI ======
+        for event_data, sensor_result in pending_ai_events:
+            auto_ai_respond(event_data, sensor_result)
         
         # 放入实时队列
         if not latest_data_queue.full():
